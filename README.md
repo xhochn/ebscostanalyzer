@@ -6,8 +6,8 @@ Installation:
 
 Quick Start:
 
-$ python EbsAnalyzer.py -a <aws access key> -s <aws secret key>
+$ python EbsCostAnalyzer.py -a <aws access key> -s <aws secret key>
 
 For more information about options:
 
-$ python EbsAnalyzer.py -h
+$ python EbsCostAnalyzer.py -h

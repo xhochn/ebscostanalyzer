@@ -173,15 +173,16 @@ def roundup(a):
 #
 def find_max(data, field):
     m = 0
-    for i in range(len(data)-1):
-        m = max(m, data[i][field])
+    if (len(data) > 0):
+        for i in range(len(data)-1):
+            m = max(m, data[i][field])
     return m
 
 #
 # returns maximum value for IOPS over 14-day period by default.
 # metricName can be 'VolumeReadOps' or 'VolumeWriteOps'
 #
-def get_iops(cloudWatch, ebsId, metricName, useAvg):
+def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
     iops = 0
     startTime = arrow.now(FC_TIME_ZONE).replace(days=-FC_STAT_DAYS, hour=0, minute=0, second=0, microsecond=0).format(TIME_FMT)
     endTime = arrow.now(FC_TIME_ZONE).format(TIME_FMT)
@@ -201,20 +202,23 @@ def get_iops(cloudWatch, ebsId, metricName, useAvg):
                                             Unit='Count')
         # because we starting from beginning of day, we will usually
         # have FC_STAT_DAYS + 1 data points
-        if (len(response['Datapoints']) >= FC_STAT_DAYS):
+        if ((arrow.get(startTime) - arrow.get(createTime)).days > FC_STAT_DAYS):
+        #if (len(response['Datapoints']) >= FC_STAT_DAYS):
             # CloudWatch will occasionally have bizarre values for IOPS.
             # I don't know why, but I sometimes see up to 300,000+ IOPS for an
             # 8GB gp2 volume.  I currently have a support ticket open for this.
-            if (useAvg == False):
+            if (len(response['Datapoints']) == 0):
+                iops = -1 # sometimes cloudwatch doesn't save data, no idea why
+            elif (useAvg == False):
                 iops = find_max(response['Datapoints'], 'Maximum')
             else:
                 iops = find_max(response['Datapoints'], 'Average')
         else:
-            iops = -1 # younger than 14 days
+            iops = -2 # younger than 14 days
     except:
         e = sys.exc_info()
         print("Failed to get volume statistics: %s" %(str(e)))
-        iops = -1
+        iops = -2
     return iops
 
 #
@@ -239,11 +243,11 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                     iops = volume['Iops'] if 'Iops' in volume else 0
                     kmsKeyId = volume['KmsKeyId'] if 'KmsKeyId' in volume else '0'
                     if cloudWatch:
-                        readIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeReadOps', useAvg)
-                        writeIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeWriteOps', useAvg)
+                        readIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeReadOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
+                        writeIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeWriteOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
 
                     # if vol is not at least 14 days old, skip it
-                    if (readIops == -1 or writeIops == -1):
+                    if (readIops == -2 or writeIops == -2):
                         continue
 
                     # get volume name if it has one
@@ -519,14 +523,33 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
                 # for some reason, cloudwatch will return 0 for Iops
                 # for some volume types
                 if (vol.Iops == 0):
-                    vol.Iops = get_availalble_iops(vol.Type, vol.Size)
+                    vol = vol._replace(Iops=get_available_iops(vol.Type, vol.Size))
+
+                # convert to dictionary
+                advInfo = vol._asdict()
+
+                # if no cloudwatch data, assume capacity rightsizing
+                if (vol.Iops == -1):
+                    newSize = max(advInfo['Size']/2, get_minimum_size(advInfo['Type']))
+                    oldIops = get_available_iops(vol.Type, vol.Size)
+                    newIops = get_available_iops(vol.Type, newSize)
+                    cost = get_cost_savings(r,
+                                            advInfo['Type'],
+                                            advInfo['Size'],
+                                            oldIops,
+                                            advInfo['Type'],
+                                            newSize,
+                                            newIops)
+                    summary['capacity_savings'] += cost
+                    summary['total_savings'] += cost
+                    continue
+
 
                 # - RecommendedType will be changed if migrating to new type
                 # - RecommendedIops will be changed if io1 migrates to io1
                 # with fewer provisioned IOPS
                 # - RecommendedSize will be changed if io1 -> gp2, but gp2
                 # must be increased in size to meet IOPS demand
-                advInfo = vol._asdict()
                 advInfo['RecommendedType'] = advInfo['Type']
                 advInfo['RecommendedIops'] = advInfo['Iops']
                 advInfo['RecommendedSize'] = advInfo['Size']

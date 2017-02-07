@@ -414,9 +414,9 @@ def get_available_iops(volType, size=0):
     if (volType == 'gp2'):
         iops = size * GP2_IOPS_PER_GB
         if (iops < get_minimum_iops('gp2')):
-            return 100
+            return get_minimum_iops('gp2')
         elif (iops > get_maximum_iops('gp2')):
-            return 10000
+            return get_maximum_iops('gp2')
         else:
             return iops
     if (volType == 'st1'):
@@ -519,7 +519,7 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
                 # for some reason, cloudwatch will return 0 for Iops
                 # for some volume types
                 if (vol.Iops == 0):
-                    vol.Iops = get_availalble_iops(vol.Type)
+                    vol.Iops = get_availalble_iops(vol.Type, vol.Size)
 
                 # - RecommendedType will be changed if migrating to new type
                 # - RecommendedIops will be changed if io1 migrates to io1
@@ -666,7 +666,7 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
                             advInfo['Status'],
                             advInfo['Type'],
                             advInfo['Size'],
-                            get_available_iops(advInfo['Type']),
+                            get_available_iops(advInfo['Type'], advInfo['Size']),
                             FC_STAT_DAYS,
                             advInfo['MetricType'],
                             totalIops,

@@ -517,9 +517,9 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
                 summary['total_capacity'] += vol.Size
 
                 # for some reason, cloudwatch will return 0 for Iops
-                # for magnetic volumes
-                if (vol.Iops == 0 and vol.Type == 'standard'):
-                    vol.Iops = get_availalble_iops('standard')
+                # for some volume types
+                if (vol.Iops == 0):
+                    vol.Iops = get_availalble_iops(vol.Type)
 
                 # - RecommendedType will be changed if migrating to new type
                 # - RecommendedIops will be changed if io1 migrates to io1

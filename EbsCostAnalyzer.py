@@ -186,6 +186,10 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
     iops = 0
     startTime = arrow.now(FC_TIME_ZONE).replace(days=-FC_STAT_DAYS, hour=0, minute=0, second=0, microsecond=0).format(TIME_FMT)
     endTime = arrow.now(FC_TIME_ZONE).format(TIME_FMT)
+
+    if ((arrow.get(startTime) - arrow.get(createTime)).days <= FC_STAT_DAYS):
+        return -2       # Younger than 14 days
+
     if (useAvg == False):
         statistic = 'Maximum'
     else:
@@ -202,19 +206,15 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
                                             Unit='Count')
         # because we starting from beginning of day, we will usually
         # have FC_STAT_DAYS + 1 data points
-        if ((arrow.get(startTime) - arrow.get(createTime)).days > FC_STAT_DAYS):
-        #if (len(response['Datapoints']) >= FC_STAT_DAYS):
-            # CloudWatch will occasionally have bizarre values for IOPS.
-            # I don't know why, but I sometimes see up to 300,000+ IOPS for an
-            # 8GB gp2 volume.  I currently have a support ticket open for this.
-            if (len(response['Datapoints']) == 0):
-                iops = -1 # sometimes cloudwatch doesn't save data, no idea why
-            elif (useAvg == False):
-                iops = find_max(response['Datapoints'], 'Maximum')
-            else:
-                iops = find_max(response['Datapoints'], 'Average')
+        # CloudWatch will occasionally have bizarre values for IOPS.
+        # I don't know why, but I sometimes see up to 300,000+ IOPS for an
+        # 8GB gp2 volume.  I currently have a support ticket open for this.
+        if (len(response['Datapoints']) == 0):
+            iops = -1 # sometimes cloudwatch doesn't save data, no idea why
+        elif (useAvg == False):
+            iops = find_max(response['Datapoints'], 'Maximum')
         else:
-            iops = -2 # younger than 14 days
+            iops = find_max(response['Datapoints'], 'Average')
     except:
         e = sys.exc_info()
         print("Failed to get volume statistics: %s" %(str(e)))
@@ -236,6 +236,13 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
             try:
                 responseVol = ec2Connection.describe_volumes(DryRun=False, VolumeIds=ebsIdList)
                 for volume in responseVol['Volumes']:
+                    # Skip root devices.
+                    # Paravirtual reserves /dev/sda1 for root dev
+                    # HVM could be either /dev/sda1 or /dev/xvda
+                    if (volume['Attachments'][0]['Device'] == "/dev/sda1" or
+                        volume['Attachments'][0]['Device'] == "/dev/xvda"):
+                        continue
+
                     # get EBS tags
                     volTags = ec2Connection.describe_tags(
                         Filters=[{'Name': 'resource-id', 'Values': [volume['VolumeId']]}])
@@ -247,8 +254,8 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                         writeIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeWriteOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
 
                     # if vol is not at least 14 days old, skip it
-                    if (readIops == -2 or writeIops == -2):
-                        continue
+                    #if (readIops == -2 or writeIops == -2):
+                    #    continue
 
                     # get volume name if it has one
                     volName = ""
@@ -281,13 +288,6 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                             KmsKeyId    = kmsKeyId,
                             Tags        = volTags['Tags'])
                     else:
-                        # Skip root devices.
-                        # Paravirtual reserves /dev/sda1 for root dev
-                        # HVM could be either /dev/sda1 or /dev/xvda
-                        if (volume['Attachments'][0]['Device'] == "/dev/sda1" or
-                            volume['Attachments'][0]['Device'] == "/dev/xvda"):
-                            continue
-
                         # get ec2 instance name if it has one
                         ec2Tags = ec2Connection.describe_tags(         \
                             Filters=[{'Name': 'resource-id', 'Values': \
@@ -527,23 +527,6 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
 
                 # convert to dictionary
                 advInfo = vol._asdict()
-
-                # if no cloudwatch data, assume capacity rightsizing
-                if (vol.Iops == -1):
-                    newSize = max(advInfo['Size']/2, get_minimum_size(advInfo['Type']))
-                    oldIops = get_available_iops(vol.Type, vol.Size)
-                    newIops = get_available_iops(vol.Type, newSize)
-                    cost = get_cost_savings(r,
-                                            advInfo['Type'],
-                                            advInfo['Size'],
-                                            oldIops,
-                                            advInfo['Type'],
-                                            newSize,
-                                            newIops)
-                    summary['capacity_savings'] += cost
-                    summary['total_savings'] += cost
-                    continue
-
 
                 # - RecommendedType will be changed if migrating to new type
                 # - RecommendedIops will be changed if io1 migrates to io1

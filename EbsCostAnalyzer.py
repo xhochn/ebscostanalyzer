@@ -19,6 +19,7 @@
 import boto3
 import botocore
 import sys
+import traceback
 import os
 import time
 import pytz
@@ -188,7 +189,7 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
     endTime = arrow.now(FC_TIME_ZONE).format(TIME_FMT)
 
     if ((arrow.get(startTime) - arrow.get(createTime)).days <= FC_STAT_DAYS):
-        return -1       # Younger than 14 days
+        return -1 # Younger than 14 days
 
     if (useAvg == False):
         statistic = 'Maximum'
@@ -239,9 +240,11 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                     # Skip root devices.
                     # Paravirtual reserves /dev/sda1 for root dev
                     # HVM could be either /dev/sda1 or /dev/xvda
-                    if (volume['Attachments'][0]['Device'] == "/dev/sda1" or
-                        volume['Attachments'][0]['Device'] == "/dev/xvda"):
-                        continue
+                    if (('Attachments' in volume or volume['Attachments']) and
+                        (len(volume['Attachments']) > 0)):
+                        if (volume['Attachments'][0]['Device'] == "/dev/sda1" or
+                            volume['Attachments'][0]['Device'] == "/dev/xvda"):
+                            continue
 
                     # get EBS tags
                     volTags = ec2Connection.describe_tags(
@@ -264,12 +267,14 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                             volName = tag['Value']
                             break
 
-                    if not 'Attachments' in volume or not volume['Attachments']:
+                    if (not 'Attachments' in volume or
+                        not volume['Attachments'] or
+                        len(volume['Attachments']) == 0):
                         ebsInfo = EbsInfo(
                             VolId       = volume['VolumeId'],
                             VolName     = volName,
                             Ec2Id       = "NA",
-                            Ec2Name     = "NA",
+                            Ec2Name     = "",
                             Type        = volume['VolumeType'],
                             Size        = volume['Size'],
                             Device      = "NA",
@@ -333,6 +338,7 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
             except:
                 e = sys.exc_info()
                 print("Failed to get ebs volume info: %s" %(str(e)))
+                traceback.print_exc()
                 return listOfEbsInfo
         if count >= retry:
             print("Failed to get ebs volume info after retry")
@@ -466,6 +472,37 @@ def get_cost_savings(region, oldType, oldSize, oldIops,
 def dump_advisory_json(advInfo):
     print json.dumps(advInfo, sort_keys=True, indent=4)
 
+# We can use FittedCloud's EBS capacity rightsizing to ynamically resize a
+# volume to be only as big as the amount of space being used.  On average,
+# aws users overprovision by a factor of 2, so assume that for
+# cost saving estimates.
+#
+# This function is called in two circumstance:
+#   1. No migration advisories are found for the volume
+#       - must be done after we check for advisories
+#   2. The volume is either too young or has no cloudwatch data
+#       - must be done before we check for advisories
+# iops parameter only matters for io1
+#
+# returns cost savings
+def capacity_rightsizing(region, volType, volSize, iops):
+    newSize = max(volSize/2, get_minimum_size(volType))
+    if (volType == 'io1'):
+        oldIops = iops
+        newIops = iops
+    else:
+        oldIops = get_available_iops(volType, volSize)
+        newIops = get_available_iops(volType, newSize)
+
+    cost = get_cost_savings(region,
+                            volType,
+                            volSize,
+                            oldIops,
+                            volType,
+                            newSize,
+                            newIops)
+    return cost
+
 #
 # Loops through region list and finds volumes that can benefit from migration.
 #
@@ -505,197 +542,196 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
         ec2resource = botoSession.resource('ec2')
 
         ebsList = ec2resource.volumes.all()
+
+        # fetch all volume information for region in one call
+        volList = []
         for ebs in ebsList:
-            ebs_info = get_ebs_info(botoClient, cloudWatch, [ebs.id], useAvg)
+            volList.append(ebs.id)
+        ebs_info = get_ebs_info(botoClient, cloudWatch, volList, useAvg)
 
-            # will typically land here if volume is a root device
-            # or device is not old enough (14 days)
-            if (len(ebs_info) == 0):
-                #print("No info for volume = %s" %(ebs.id))
-                continue
+        for vol in ebs_info:
+            # update counters
+            summary[vol.Type]['count'] += 1
+            summary[vol.Type]['size'] += vol.Size
+            summary['total_capacity'] += vol.Size
 
-            for vol in ebs_info:
-                # update counters
-                summary[vol.Type]['count'] += 1
-                summary[vol.Type]['size'] += vol.Size
-                summary['total_capacity'] += vol.Size
+            # for some reason, cloudwatch will return 0 for Iops
+            # for some volume types
+            if (vol.Iops == 0):
+                vol = vol._replace(Iops=get_available_iops(vol.Type, vol.Size))
 
-                # for some reason, cloudwatch will return 0 for Iops
-                # for some volume types
-                if (vol.Iops == 0):
-                    vol = vol._replace(Iops=get_available_iops(vol.Type, vol.Size))
+            # convert to dictionary
+            advInfo = vol._asdict()
 
-                # convert to dictionary
-                advInfo = vol._asdict()
+            # - RecommendedType will be changed if migrating to new type
+            # - RecommendedIops will be changed if io1 migrates to io1
+            # with fewer provisioned IOPS
+            # - RecommendedSize will be changed if io1 -> gp2, but gp2
+            # must be increased in size to meet IOPS demand
+            advInfo['RecommendedType'] = advInfo['Type']
+            advInfo['RecommendedIops'] = advInfo['Iops']
+            advInfo['RecommendedSize'] = advInfo['Size']
+            advInfo['Region'] = r;
+            if (useAvg == False):
+                advInfo['MetricType'] = "max"
+            else:
+                advInfo['MetricType'] = "avg"
 
-                # - RecommendedType will be changed if migrating to new type
-                # - RecommendedIops will be changed if io1 migrates to io1
-                # with fewer provisioned IOPS
-                # - RecommendedSize will be changed if io1 -> gp2, but gp2
-                # must be increased in size to meet IOPS demand
-                advInfo['RecommendedType'] = advInfo['Type']
-                advInfo['RecommendedIops'] = advInfo['Iops']
-                advInfo['RecommendedSize'] = advInfo['Size']
-                advInfo['Region'] = r;
-                if (useAvg == False):
-                    advInfo['MetricType'] = "max"
-                else:
-                    advInfo['MetricType'] = "avg"
+            totalIops = vol.ReadIops + vol.WriteIops
 
-                totalIops = vol.ReadIops + vol.WriteIops
+            # for unattached ebs, estimate cost savings by assuming
+            # deletion of volume, as we cannot predict snapshot size
+            if (vol.Status == FC_EBS_STATUS_UNATTACHED):
+                advInfo['RecommendedSize'] = 0
+                advInfo['RecommendedIops'] = 0
 
-                # for unattached ebs, estimate cost savings by assuming
-                # deletion of volume, as we cannot predict snapshot size
-                if (vol.Status == FC_EBS_STATUS_UNATTACHED):
-                    advInfo['RecommendedSize'] = 0
-                    advInfo['RecommendedIops'] = 0
+                # unattached and either too young or no cloudwatch data
+                if (totalIops < 0):
+                    totalIops = 0
 
-                # Migration of GP2
-                elif (vol.Type == 'gp2'):
-                    # There may be cases where we can save money by
-                    # migrating a gp2 less than 500GB to st1 or sc1
-                    # but using a simple heuristic for now.
-                    if (vol.Size >= get_minimum_size('st1')):
-                        if (totalIops < get_available_iops('st1')):
-                            advInfo['RecommendedType'] = 'st1'
-                            advInfo['RecommendedIops'] = get_available_iops('sc1')
-                    if (vol.Size >= get_minimum_size('sc1')):
-                        if (totalIops < get_available_iops('sc1')):
-                            advInfo['RecommendedType'] = 'sc1'
-                            advInfo['RecommendedIops'] = get_available_iops('sc1')
+            # if volume too young or no cloudwatch data, do ebs rightsizing
+            elif (vol.ReadIops == -1 or vol.WriteIops == -1):
+                cost = capacity_rightsizing(r, advInfo['Type'], advInfo['Size'], vol.Iops)
+                totalIops = 0 # set to zero to avoid confusing output
+                summary['capacity_savings'] += cost
+                summary['total_savings'] += cost
 
-                # Migration of ST1
-                elif (vol.Type == 'st1'):
+            # Migration of GP2
+            elif (vol.Type == 'gp2'):
+                # There may be cases where we can save money by
+                # migrating a gp2 less than 500GB to st1 or sc1
+                # but using a simple heuristic for now.
+                if (vol.Size >= get_minimum_size('st1')):
+                    if (totalIops < get_available_iops('st1')):
+                        advInfo['RecommendedType'] = 'st1'
+                        advInfo['RecommendedIops'] = get_available_iops('sc1')
+                if (vol.Size >= get_minimum_size('sc1')):
                     if (totalIops < get_available_iops('sc1')):
                         advInfo['RecommendedType'] = 'sc1'
                         advInfo['RecommendedIops'] = get_available_iops('sc1')
 
-                # Migration of IO1
-                elif (vol.Type == 'io1'):
-                    if (totalIops < get_maximum_iops('gp2')):
-                        if (totalIops >= vol.Iops * IO1_IOPS_THRESHOLD):
-                            advInfo['RecommendedType'] = 'gp2'
+            # Migration of ST1
+            elif (vol.Type == 'st1'):
+                if (totalIops < get_available_iops('sc1')):
+                    advInfo['RecommendedType'] = 'sc1'
+                    advInfo['RecommendedIops'] = get_available_iops('sc1')
 
-                            # Might need to increase size of gp2 to get same
-                            # IOPS as io1's provisioned IOPS
-                            if (vol.Size * GP2_IOPS_PER_GB < totalIops):
-                                advInfo['RecommendedSize'] = roundup(totalIops / GP2_IOPS_PER_GB)
-                                advInfo['RecommendedIops'] = advInfo['RecommendedSize'] * GP2_IOPS_PER_GB
-                        else:
-                            advInfo['RecommendedIops'] = max(totalIops, get_minimum_iops('io1'))
+            # Migration of IO1
+            elif (vol.Type == 'io1'):
+                if (totalIops < get_maximum_iops('gp2')):
+                    if (totalIops >= vol.Iops * IO1_IOPS_THRESHOLD):
+                        advInfo['RecommendedType'] = 'gp2'
 
-                # Migration of magnetic
-                elif (vol.Type == 'standard'):
-                    # SC1 is roughly half the price per GB than magnetic, but
-                    # has a minimum size of 500GB.  It's possible in some
-                    # regions that migrating a 250GB magnetic to 500GB SC1
-                    # will cost more.  Using simple heuristic for size checking.
-                    if ((vol.Size >= get_minimum_size('sc1')) and
-                        (vol.Size < get_maximum_size('sc1'))):
-                        advInfo['RecommendedType'] = 'sc1'
-
-                # calculate cost savings and advice string for an advisory
-                if (advInfo['Type'] != advInfo['RecommendedType'] or
-                    advInfo['Iops'] != advInfo['RecommendedIops'] or
-                    advInfo['Size'] != advInfo['RecommendedSize'] or
-                    advInfo['Status'] == FC_EBS_STATUS_UNATTACHED):
-
-                    # only needed for commented-out message below
-                    advisory_found = 1
-
-                    # update counter
-                    summary['num_advisories'] += 1
-                    cost = get_cost_savings(r,
-                                            advInfo['Type'],
-                                            advInfo['Size'],
-                                            advInfo['Iops'],
-                                            advInfo['RecommendedType'],
-                                            advInfo['RecommendedSize'],
-                                            advInfo['RecommendedIops'])
-                    # round to two decimal places
-                    cost = round(cost, 2)
-
-                    # record total and per-advisory cost savings
-                    # per-advisory savings will be displayed in JSON output
-                    advInfo['MonthlyCostSavings'] = cost
-                    summary['total_savings'] += cost
-
-                    if (advInfo['Status'] == FC_EBS_STATUS_UNATTACHED):
-                        advInfo['Advice'] = "Delete or take snapshot then delete."
-                        summary['unattached_savings'] += cost
-                        if (useJson == True):
-                            json_advisory['Unattached'].append(advInfo)
-
+                        # Might need to increase size of gp2 to get same
+                        # IOPS as io1's provisioned IOPS
+                        if (vol.Size * GP2_IOPS_PER_GB < totalIops):
+                            advInfo['RecommendedSize'] = roundup(totalIops / GP2_IOPS_PER_GB)
+                            advInfo['RecommendedIops'] = advInfo['RecommendedSize'] * GP2_IOPS_PER_GB
                     else:
-                        # update cost savings for migration
-                        summary['ebsmotion_savings'] += cost
+                        advInfo['RecommendedIops'] = max(totalIops, get_minimum_iops('io1'))
 
-                        advInfo['Advice'] = "Migrate to %s." %(advInfo['RecommendedType'])
+            # Migration of magnetic
+            elif (vol.Type == 'standard'):
+                # SC1 is roughly half the price per GB than magnetic, but
+                # has a minimum size of 500GB.  It's possible in some
+                # regions that migrating a 250GB magnetic to 500GB SC1
+                # will cost more.  Using simple heuristic for size checking.
+                if ((vol.Size >= get_minimum_size('sc1')) and
+                    (vol.Size < get_maximum_size('sc1'))):
+                    advInfo['RecommendedType'] = 'sc1'
 
-                        if (advInfo['Size'] != advInfo['RecommendedSize']):
-                            advInfo['Advice'] += "  Set size to %dGB." %(advInfo['RecommendedSize'])
-                        # io1 -> io1 with fewer provisioned IOPS
-                        elif (advInfo['Iops'] != advInfo['RecommendedSize'] and
-                              advInfo['Type'] == advInfo['RecommendedType']):
-                            advInfo['Advice'] += "  Set Iops to %d IOPS." %(advInfo['RecommendedIops'])
-                        if (useJson == True):
-                            json_advisory['Migration'].append(advInfo)
+            # calculate cost savings and advice string for an advisory
+            if (advInfo['Type'] != advInfo['RecommendedType'] or
+                advInfo['Iops'] != advInfo['RecommendedIops'] or
+                advInfo['Size'] != advInfo['RecommendedSize'] or
+                advInfo['Status'] == FC_EBS_STATUS_UNATTACHED):
 
-                    # Finally, dump the output if there is an advisory
-                    if (useJson == False):
-                        if (advInfo['VolName'] != ""):
-                            vName = " (%s)" %(advInfo['VolName'])
-                        else:
-                            vName = ""
+                # only needed for commented-out message below
+                advisory_found = 1
 
-                        if (advInfo['Ec2Name'] != ""):
-                            eName = " (%s)" %(advInfo['Ec2Name'])
-                        else:
-                            eName = ""
-                        print(
-                            "EBS Advisory:\n"
-                            "\tRegion: %s\n"
-                            "\tEC2 ID: %s%s\n"
-                            "\tVolume ID: %s%s\n"
-                            "\tStatus: %s\n"
-                            "\tType: %s\n"
-                            "\tSize: %d GB\n"
-                            "\tCurrent available IOPS: %d\n"
-                            "\tOver a %d day period, %s IOPS observed %d\n"
-                            "\tAdvice: %s\n"
-                            "\tMonthly Cost Savings: $%.2f\n"
-                            %(advInfo['Region'],
-                            advInfo['Ec2Id'],
-                            eName,
-                            advInfo["VolId"],
-                            vName,
-                            advInfo['Status'],
-                            advInfo['Type'],
-                            advInfo['Size'],
-                            get_available_iops(advInfo['Type'], advInfo['Size']),
-                            FC_STAT_DAYS,
-                            advInfo['MetricType'],
-                            totalIops,
-                            advInfo['Advice'],
-                            advInfo['MonthlyCostSavings']))
+                # update counter
+                summary['num_advisories'] += 1
+                cost = get_cost_savings(r,
+                                        advInfo['Type'],
+                                        advInfo['Size'],
+                                        advInfo['Iops'],
+                                        advInfo['RecommendedType'],
+                                        advInfo['RecommendedSize'],
+                                        advInfo['RecommendedIops'])
+                # round to two decimal places
+                cost = round(cost, 2)
 
-                # If no advisories, we can use FittedCloud's EBS rightsizing
-                # to dynamically resize a volume to be only as big as the
-                # amount of space being used.  On average, customers
-                # overprovision by a factor of 2, so assume that for
-                # cost saving estimates.
+                # record total and per-advisory cost savings
+                # per-advisory savings will be displayed in JSON output
+                advInfo['MonthlyCostSavings'] = cost
+                summary['total_savings'] += cost
+
+                if (advInfo['Status'] == FC_EBS_STATUS_UNATTACHED):
+                    advInfo['Advice'] = "Delete or take snapshot then delete."
+                    summary['unattached_savings'] += cost
+                    if (useJson == True):
+                        json_advisory['Unattached'].append(advInfo)
+
                 else:
-                    newSize = max(advInfo['Size']/2, get_minimum_size(advInfo['Type']))
-                    cost = get_cost_savings(r,
-                                            advInfo['Type'],
-                                            advInfo['Size'],
-                                            advInfo['Iops'],
-                                            advInfo['Type'],
-                                            newSize,
-                                            advInfo['Iops'])
-                    #cost_savings['Capacity'] += cost
-                    summary['capacity_savings'] += cost
-                    summary['total_savings'] += cost
+                    # update cost savings for migration
+                    summary['ebsmotion_savings'] += cost
+
+                    advInfo['Advice'] = "Migrate to %s." %(advInfo['RecommendedType'])
+
+                    if (advInfo['Size'] != advInfo['RecommendedSize']):
+                        advInfo['Advice'] += "  Set size to %dGB." %(advInfo['RecommendedSize'])
+                    # io1 -> io1 with fewer provisioned IOPS
+                    elif (advInfo['Iops'] != advInfo['RecommendedSize'] and
+                          advInfo['Type'] == advInfo['RecommendedType']):
+                        advInfo['Advice'] += "  Set Iops to %d IOPS." %(advInfo['RecommendedIops'])
+                    if (useJson == True):
+                        json_advisory['Migration'].append(advInfo)
+
+                # Finally, dump the output if there is an advisory
+                if (useJson == False):
+                    if (advInfo['VolName'] != ""):
+                        vName = " (%s)" %(advInfo['VolName'])
+                    else:
+                        vName = ""
+
+                    if (advInfo['Ec2Name'] != ""):
+                        eName = " (%s)" %(advInfo['Ec2Name'])
+                    else:
+                        eName = ""
+                    print(
+                        "EBS Advisory:\n"
+                        "\tRegion: %s\n"
+                        "\tEC2 ID: %s%s\n"
+                        "\tVolume ID: %s%s\n"
+                        "\tCreate Time: %s\n"
+                        "\tStatus: %s\n"
+                        "\tType: %s\n"
+                        "\tSize: %d GB\n"
+                        "\tCurrent available IOPS: %d\n"
+                        "\tOver a %d day period, %s IOPS observed %d\n"
+                        "\tAdvice: %s\n"
+                        "\tMonthly Cost Savings: $%.2f\n"
+                        %(advInfo['Region'],
+                        advInfo['Ec2Id'],
+                        eName,
+                        advInfo["VolId"],
+                        vName,
+                        advInfo['CreateTime'],
+                        advInfo['Status'],
+                        advInfo['Type'],
+                        advInfo['Size'],
+                        get_available_iops(advInfo['Type'], advInfo['Size']),
+                        FC_STAT_DAYS,
+                        advInfo['MetricType'],
+                        totalIops,
+                        advInfo['Advice'],
+                        advInfo['MonthlyCostSavings']))
+
+            # If no advisories, we can use FittedCloud's EBS rightsizing
+            else:
+                cost = capacity_rightsizing(r, advInfo['Type'], advInfo['Size'], vol.Iops)
+                summary['capacity_savings'] += cost
+                summary['total_savings'] += cost
 
         # No advisories found for this region.
         # Uncomment if you want to print out a message.
@@ -736,17 +772,18 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
 
 
 def print_usage():
-     print("EbsMotionAdvisory.py <options>\n"
+     print("EbsCostAdvisor.py <options>\n"
            "\tOptions are:\n\n"
            "\t-h --help - Display this help message\n"
            "\t-a --accesskey <access key> - AWS access key (required)\n"
            "\t-s --secretkey <secret key> - AWS secret key (required)\n"
            "\t-r --regions <region1,region2,...> - A list of AWS regions.  If this option is omitted, all regions will be checked.\n"
            "\t-m --mean - Use average (mean) values instead of maximum values for metrics used to determine advisories.\n"
-           "\t-j --json - Output in JSON format.")
+           "\t-j --json - Output in JSON format.\n\n"
+           "\tDepending on the number of EBS volumes being analyzed, this tool make take several minutes to run.")
 
 def parse_options(argv):
-    parser = argparse.ArgumentParser(prog="EbsMotionAdvisory.py",
+    parser = argparse.ArgumentParser(prog="EbsCostAdvisor.py",
              add_help=False) # use print_usage() instead
 
     parser.add_argument("-a", "--access-key", type=str, required=True)

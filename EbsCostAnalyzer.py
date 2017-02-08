@@ -203,8 +203,8 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
         # because we starting from beginning of day, we will usually
         # have FC_STAT_DAYS + 1 data points
         if ((arrow.get(startTime) - arrow.get(createTime)).days > FC_STAT_DAYS):
-        #if (len(response['Datapoints']) >= FC_STAT_DAYS):
             # CloudWatch will occasionally have bizarre values for IOPS.
+            # CloudWatch will occasionally not collect data on EBS volumes.
             # I don't know why, but I sometimes see up to 300,000+ IOPS for an
             # 8GB gp2 volume.  I currently have a support ticket open for this.
             if (len(response['Datapoints']) == 0):
@@ -214,7 +214,7 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
             else:
                 iops = find_max(response['Datapoints'], 'Average')
         else:
-            iops = -2 # younger than 14 days
+            iops = -1 # younger than 14 days
     except:
         e = sys.exc_info()
         print("Failed to get volume statistics: %s" %(str(e)))
@@ -246,7 +246,7 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                         readIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeReadOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
                         writeIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeWriteOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
 
-                    # if vol is not at least 14 days old, skip it
+                    # skip vol on an error
                     if (readIops == -2 or writeIops == -2):
                         continue
 
@@ -528,8 +528,9 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
                 # convert to dictionary
                 advInfo = vol._asdict()
 
-                # if no cloudwatch data, assume capacity rightsizing
-                if (vol.Iops == -1):
+                # if no cloudwatch data, or volume too young
+                # assume capacity rightsizing
+                if (vol.ReadIops == -1 or vol.WriteIops == -1):
                     newSize = max(advInfo['Size']/2, get_minimum_size(advInfo['Type']))
                     oldIops = get_available_iops(vol.Type, vol.Size)
                     newIops = get_available_iops(vol.Type, newSize)

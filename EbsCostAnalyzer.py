@@ -188,7 +188,7 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
     endTime = arrow.now(FC_TIME_ZONE).format(TIME_FMT)
 
     if ((arrow.get(startTime) - arrow.get(createTime)).days <= FC_STAT_DAYS):
-        return -2       # Younger than 14 days
+        return -1       # Younger than 14 days
 
     if (useAvg == False):
         statistic = 'Maximum'
@@ -253,9 +253,9 @@ def get_ebs_info(ec2Connection, cloudWatch, ebsIdList, useAvg):
                         readIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeReadOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
                         writeIops = get_iops(cloudWatch, volume['VolumeId'], 'VolumeWriteOps', arrow.get(volume['CreateTime']).to(FC_TIME_ZONE).format(TIME_FMT), useAvg)
 
-                    # if vol is not at least 14 days old, skip it
-                    #if (readIops == -2 or writeIops == -2):
-                    #    continue
+                    # skip vol on an error
+                    if (readIops == -2 or writeIops == -2):
+                        continue
 
                     # get volume name if it has one
                     volName = ""

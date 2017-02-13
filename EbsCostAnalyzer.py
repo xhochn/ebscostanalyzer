@@ -1,5 +1,5 @@
 #----------------------------------------------------------------------------
-# Copyright 2016, FittedCloud, Inc.
+# Copyright 2017, FittedCloud, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import json
 from dateutil.tz import *
 from collections import namedtuple
 
+FC_AWS_ENV = "AWS_DEFAULT_PROFILE"
 FC_TIME_ZONE = "US/Eastern"
 TIME_FMT = 'YYYY-MM-DDTHH:mm:ssZ'
 FC_EBS_STATUS_ATTACHED = 'attached'
@@ -537,6 +538,7 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
         except:
             e = sys.exc_info()
             print("ERROR: Failed to get boto3.Session region = %s error = %s" %(r, str(e)))
+            traceback.print_exc()
             return
 
         ec2resource = botoSession.resource('ec2')
@@ -775,28 +777,34 @@ def print_usage():
      print("EbsCostAdvisor.py <options>\n"
            "\tOptions are:\n\n"
            "\t-h --help - Display this help message\n"
-           "\t-a --accesskey <access key> - AWS access key (required)\n"
-           "\t-s --secretkey <secret key> - AWS secret key (required)\n"
+           "\t-p --profile <profile name> - AWS profile name (can be used instead of -a and -s options)\n"
+           "\t-a --accesskey <access key> - AWS access key\n"
+           "\t-s --secretkey <secret key> - AWS secret key\n"
            "\t-r --regions <region1,region2,...> - A list of AWS regions.  If this option is omitted, all regions will be checked.\n"
            "\t-m --mean - Use average (mean) values instead of maximum values for metrics used to determine advisories.\n"
            "\t-j --json - Output in JSON format.\n\n"
+           "\tOne of the following three parameters are required:\n"
+           "\t\t1. Both the -a and -s options.\n"
+           "\t\t2. The -p option.\n"
+           "\t\t3. A valid " + FC_AWS_ENV + " enviornment variable.\n\n"
            "\tDepending on the number of EBS volumes being analyzed, this tool make take several minutes to run.")
 
 def parse_options(argv):
     parser = argparse.ArgumentParser(prog="EbsCostAdvisor.py",
              add_help=False) # use print_usage() instead
 
-    parser.add_argument("-a", "--access-key", type=str, required=True)
-    parser.add_argument("-s", "--secret-key", type=str, required=True)
+    parser.add_argument("-p", "--profile", type=str, required=False)
+    parser.add_argument("-a", "--access-key", type=str, required=False)
+    parser.add_argument("-s", "--secret-key", type=str, required=False)
     parser.add_argument("-r", "--regions", type=str, default="")
     parser.add_argument("-m", "--mean", action="store_true", default=False)
     parser.add_argument("-j", "--json", action="store_true", default=False)
 
     args = parser.parse_args(argv)
     if (len(args.regions) == 0):
-        return args.access_key, args.secret_key, [], args.mean, args.json
+        return args.profile, args.access_key, args.secret_key, [], args.mean, args.json
     else:
-        return args.access_key, args.secret_key, args.regions.split(','), args.mean, args.json
+        return args.profile, args.access_key, args.secret_key, args.regions.split(','), args.mean, args.json
 
 def parse_args(argv):
     # ArgumentParser's built-in way of automatically handling -h and --help
@@ -807,15 +815,43 @@ def parse_args(argv):
                 print_usage()
                 os._exit(0)
         else:
-            a, s, rList, m, j = parse_options(argv[1:])
+            p, a, s, rList, m, j = parse_options(argv[1:])
     else:
         print_usage()
         os._exit(0)
 
-    return a, s, rList, m, j
+    return p, a, s, rList, m, j
 
 if __name__ == "__main__":
-    a, s, rList, m, j = parse_args(sys.argv)
+    p, a, s, rList, m, j = parse_args(sys.argv)
+
+    # need either -a and -s, -p, or AWS_DEFAULT_PROFILE environment variable
+    if not a and not s and not p:
+        if (FC_AWS_ENV in os.environ):
+            p = os.environ[FC_AWS_ENV]
+        else:
+            print("Error: must provide either -p option or -a and -s options")
+            os_exit(1)
+
+    if p:
+        try:
+            home = os.environ["HOME"]
+            pFile = open(home + "/.aws/credentials", "r")
+            line = pFile.readline()
+            while p not in line:
+                line = pFile.readline()
+                if (line == ""): # end of file
+                    print("Invalid profile: %s" %p)
+                    os._exit(1)
+
+            # get secret access key
+            a = pFile.readline().strip().split(" ")[2]
+            s = pFile.readline().strip().split(" ")[2]
+
+        except:
+            print("Error reading credentials for profile %s." %p)
+            os._exit(1)
+
     if (len(rList) == 0):
         rList = aws_regions
     analyze_ebs_motion(a, s, rList, m, j)

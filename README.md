@@ -7,6 +7,8 @@ Installation:
 Quick Start:
 
 $ python EbsCostAnalyzer.py -a [aws access key] -s [aws secret key]
+$ python EbsCostAnalyzer.py -p [profile name]
+$ AWS_DEFAULT_PROFILE=default python EbsCostAnalyzer.py
 
 For more information about options:
 

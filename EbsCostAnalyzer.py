@@ -809,7 +809,7 @@ def parse_options(argv):
 def parse_args(argv):
     # ArgumentParser's built-in way of automatically handling -h and --help
     # leaves much to be desired, so using this hack instead.
-    if (len(argv) > 1):
+    if (len(argv) > 0):
         for arg in argv:
             if (arg == '-h' or arg == '--help'):
                 print_usage()
@@ -831,7 +831,7 @@ if __name__ == "__main__":
             p = os.environ[FC_AWS_ENV]
         else:
             print("Error: must provide either -p option or -a and -s options")
-            os_exit(1)
+            os._exit(1)
 
     if p:
         try:

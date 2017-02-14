@@ -175,9 +175,8 @@ def roundup(a):
 #
 def find_max(data, field):
     m = 0
-    if (len(data) > 0):
-        for i in range(len(data)-1):
-            m = max(m, data[i][field])
+    for i in range(len(data)):
+        m = max(m, data[i][field])
     return m
 
 #
@@ -809,16 +808,12 @@ def parse_options(argv):
 def parse_args(argv):
     # ArgumentParser's built-in way of automatically handling -h and --help
     # leaves much to be desired, so using this hack instead.
-    if (len(argv) > 0):
-        for arg in argv:
-            if (arg == '-h' or arg == '--help'):
-                print_usage()
-                os._exit(0)
-        else:
-            p, a, s, rList, m, j = parse_options(argv[1:])
-    else:
-        print_usage()
-        os._exit(0)
+    for arg in argv:
+        if (arg == '-h' or arg == '--help'):
+            print_usage()
+            os._exit(0)
+
+    p, a, s, rList, m, j = parse_options(argv[1:])
 
     return p, a, s, rList, m, j
 
@@ -830,18 +825,31 @@ if __name__ == "__main__":
         if (FC_AWS_ENV in os.environ):
             p = os.environ[FC_AWS_ENV]
         else:
-            print("Error: must provide either -p option or -a and -s options")
+            print_usage()
+            print("\nError: must provide either -p option or -a and -s options")
             os._exit(1)
+
+    if a and not s and not p:
+        print_usage()
+        print("\nError: must provide secret access key using -s option")
+        os._exit(1)
+
+    if not a and s and not p:
+        print_usage()
+        print("\nError: must provide access key using -a option")
+        os._exit(1)
 
     if p:
         try:
             home = os.environ["HOME"]
             pFile = open(home + "/.aws/credentials", "r")
             line = pFile.readline()
+            p = "["+p+"]"
             while p not in line:
                 line = pFile.readline()
                 if (line == ""): # end of file
-                    print("Invalid profile: %s" %p)
+                    print_usage()
+                    print("\nError: invalid profile: %s" %p)
                     os._exit(1)
 
             # get secret access key

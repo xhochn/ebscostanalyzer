@@ -472,7 +472,7 @@ def get_cost_savings(region, oldType, oldSize, oldIops,
 def dump_advisory_json(advInfo):
     print json.dumps(advInfo, sort_keys=True, indent=4)
 
-# We can use FittedCloud's EBS capacity rightsizing to ynamically resize a
+# We can use FittedCloud's EBS capacity rightsizing to dynamically resize a
 # volume to be only as big as the amount of space being used.  On average,
 # aws users overprovision by a factor of 2, so assume that for
 # cost saving estimates.

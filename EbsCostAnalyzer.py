@@ -36,7 +36,8 @@ TIME_FMT = 'YYYY-MM-DDTHH:mm:ssZ'
 FC_EBS_STATUS_ATTACHED = 'attached'
 FC_EBS_STATUS_UNATTACHED = 'unattached'
 FC_STAT_DAYS = 14
-FC_STAT_PERIOD = 86400 # one day in seconds
+FC_STAT_PERIOD = 900 # fifteen minutes in seconds
+FC_NUM_DATAPOINTS = FC_STAT_PERIOD / 300 # number of datapoints in period
 GP2_IOPS_PER_GB = 3
 IO1_IOPS_THRESHOLD = 0.75
 
@@ -205,17 +206,19 @@ def get_iops(cloudWatch, ebsId, metricName, createTime, useAvg):
                                             Period=FC_STAT_PERIOD,
                                             Statistics=[statistic],
                                             Unit='Count')
-        # because we starting from beginning of day, we will usually
-        # have FC_STAT_DAYS + 1 data points
-        # CloudWatch will occasionally have bizarre values for IOPS.
-        # I don't know why, but I sometimes see up to 300,000+ IOPS for an
-        # 8GB gp2 volume.  I currently have a support ticket open for this.
+        # gp2, st1, and sc1 volumes update CloudWatch every 5 minutes.
+        # Thus, a 5-minute period equals a single datapoint that is the total
+        # number of IOPS during that 5-minute period.  Using only burst IOPS
+        # for gp2, an 8GB gp2 volume could theoretically perform 900,000 IOPS
+        # in a single 5-minute window.  For better accuracy, it's best to use
+        # average IOPS with a 5-minute period determined not by the "Average"
+        # statistic but by taking the value of Maximum or Average statistic
+        # in a time period and dividing it by 300 (seconds per 5 minutes).
         if (len(response['Datapoints']) == 0):
             iops = -1 # sometimes cloudwatch doesn't save data, no idea why
-        elif (useAvg == False):
-            iops = find_max(response['Datapoints'], 'Maximum')
         else:
-            iops = find_max(response['Datapoints'], 'Average')
+            iops = find_max(response['Datapoints'], statistic)/ \
+                   (FC_STAT_PERIOD/FC_NUM_DATAPOINTS)
     except:
         e = sys.exc_info()
         print("Failed to get volume statistics: %s" %(str(e)))
@@ -770,7 +773,6 @@ def analyze_ebs_motion(access, secret, rList, useAvg, useJson):
     else:
         dump_advisory_json({'Advisories': json_advisory})
         dump_advisory_json({'Summary': summary})
-
 
 def print_usage():
      print("EbsCostAdvisor.py <options>\n"
